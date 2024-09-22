@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Video & Audio Test</title>
+    <style>
+        video {
+            width: 40%;
+            margin: 20px;
+        }
+        #chat-box {
+            width: 100%;
+            height: 150px;
+            margin-top: 20px;
+            background-color: #f2f2f2;
+            padding: 10px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Video & Audio Chat</h1>
+    <div>
+        <video id="localVideo" autoplay playsinline muted></video>
+        <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+    <button id="startCall">Start Call</button>
+    <div id="chat-box"></div>
+
+    <script>
+        // Initialize WebSocket
+        const signalingSocket = new WebSocket("ws://omegle-production-240f.up.railway.app/chat");
+
+        signalingSocket.onopen = () => {
+            logMessage("Connected to signaling server.");
+        };
+
+        signalingSocket.onmessage = (message) => {
+            const data = JSON.parse(message.data);
+
+            if (data.type === "offer") {
+                handleOffer(data.offer);
+            } else if (data.type === "answer") {
+                handleAnswer(data.answer);
+            } else if (data.type === "ice-candidate") {
+                handleNewICECandidate(data.candidate);
+            }
+        };
+
+        signalingSocket.onerror = (error) => {
+            logMessage("WebSocket Error: " + error);
+        };
+
+        let localStream;
+        let peerConnection;
+
+        const localVideo = document.getElementById("localVideo");
+        const remoteVideo = document.getElementById("remoteVideo");
+        const startCallButton = document.getElementById("startCall");
+
+        const iceServers = {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }] // Public STUN server
+        };
+
+        function logMessage(message) {
+            const chatBox = document.getElementById("chat-box");
+            const newMessage = document.createElement("p");
+            newMessage.textContent = message;
+            chatBox.appendChild(newMessage);
+        }
+
+        // Initialize WebRTC and start capturing video and audio
+        startCallButton.onclick = async () => {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            localVideo.srcObject = localStream;
+
+            peerConnection = new RTCPeerConnection(iceServers);
+            localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+            peerConnection.onicecandidate = event => {
+                if (event.candidate) {
+                    signalingSocket.send(JSON.stringify({
+                        type: "ice-candidate",
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            peerConnection.ontrack = event => {
+                remoteVideo.srcObject = event.streams[0];
+            };
+
+            // Create offer
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            // Send offer to server
+            signalingSocket.send(JSON.stringify({
+                type: "offer",
+                offer: peerConnection.localDescription
+            }));
+
+            logMessage("Offer sent to the server.");
+        };
+
+        async function handleOffer(offer) {
+            if (!peerConnection) {
+                peerConnection = new RTCPeerConnection(iceServers);
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        signalingSocket.send(JSON.stringify({
+                            type: "ice-candidate",
+                            candidate: event.candidate
+                        }));
+                    }
+                };
+
+                peerConnection.ontrack = event => {
+                    remoteVideo.srcObject = event.streams[0];
+                };
+            }
+
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+
+            // Create answer
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+
+            // Send answer to server
+            signalingSocket.send(JSON.stringify({
+                type: "answer",
+                answer: peerConnection.localDescription
+            }));
+
+            logMessage("Answer sent to the server.");
+        }
+
+        function handleAnswer(answer) {
+            peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+            logMessage("Answer received from the server.");
+        }
+
+        function handleNewICECandidate(candidate) {
+            peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            logMessage("ICE candidate received from the server.");
+        }
+    </script>
+</body>
+</html>
