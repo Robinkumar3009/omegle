@@ -1,6 +1,8 @@
 
 package com.robin.omegle.bean;
 
+
+
 import java.io.IOException;
 import java.util.Map;
 import java.util.Queue;
@@ -26,6 +28,7 @@ public class ChatHandler extends TextWebSocketHandler {
         // Store active session
         activeSessions.put(session.getId(), session);
         disconnectedUsers.remove(session);
+        broadcastUserCount();
         findMatch(session);
     }
 
@@ -33,18 +36,17 @@ public class ChatHandler extends TextWebSocketHandler {
     public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         String payload = message.getPayload();
 
-        // Send message only to the matched user
-        WebSocketSession matchedSession = matchedUsers.get(session);
-
-        if (matchedSession != null && matchedSession.isOpen()) {
-            try {
-                synchronized (matchedSession) {
-                    matchedSession.sendMessage(new TextMessage(payload));
-                }
-            } catch (IOException e) {
-                System.out.println("Error sending message: " + e.getMessage());
-                matchedSession.close(CloseStatus.SERVER_ERROR);
-            }
+        // Handle different types of messages
+        switch (payload) {
+            case "skip":
+                handleSkip(session);
+                break;
+            case "queueSize":
+                sendQueueSize(session);
+                break;
+            default:
+                sendMessageToMatchedUser(session, payload);
+                break;
         }
     }
 
@@ -55,12 +57,11 @@ public class ChatHandler extends TextWebSocketHandler {
 
         // Remove the session from the matchmaking queue if it's still there
         matchmakingQueue.remove(session);
-
+        broadcastUserCount();
         // If the user was already matched, unpair the matched users
         WebSocketSession matchedSession = matchedUsers.remove(session);
         if (matchedSession != null) {
             matchedUsers.remove(matchedSession);
-            // Store this pair in previousMatches to track disconnected pairs
             previousMatches.put(session, matchedSession);
             previousMatches.put(matchedSession, session);
 
@@ -73,7 +74,7 @@ public class ChatHandler extends TextWebSocketHandler {
 
         // Add the disconnected user to the set to prevent re-queueing
         disconnectedUsers.add(session);
-
+        broadcastUserCount();
         // Try to find matches for remaining users in the queue
         if (!matchmakingQueue.isEmpty()) {
             WebSocketSession nextUser = matchmakingQueue.poll();
@@ -83,40 +84,194 @@ public class ChatHandler extends TextWebSocketHandler {
         }
     }
 
-    private void findMatch(WebSocketSession session) throws Exception {
-        // Check if the user was previously matched with someone
-        WebSocketSession previousMatch = previousMatches.get(session);
+    private void handleSkip(WebSocketSession session) throws Exception {
+        WebSocketSession previousMatch = matchedUsers.remove(session);
+        if (previousMatch != null) {
+            matchedUsers.remove(previousMatch);
 
-        // If the previous match is in the queue and both are open, reconnect them
-        if (previousMatch != null && matchmakingQueue.contains(previousMatch)) {
-            matchmakingQueue.remove(previousMatch);
-            if (previousMatch.isOpen() && session.isOpen()) {
-                notifyUsers(session, previousMatch);
-                matchedUsers.put(session, previousMatch);
-                matchedUsers.put(previousMatch, session);
-                return;
+            // Temporarily block these two users from matching again
+            previousMatches.put(session, previousMatch);
+            previousMatches.put(previousMatch, session);
+
+            // Re-add both users to the queue but ensure compatibility
+            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+                matchmakingQueue.add(session);
+            }
+            if (previousMatch.isOpen() && !disconnectedUsers.contains(previousMatch)) {
+                matchmakingQueue.add(previousMatch);
+            }
+
+            // Find new matches for both users
+            findMatch(session);
+            findMatch(previousMatch);
+        }
+    }
+    
+    
+//    private void handleSkip(WebSocketSession session) throws Exception {
+//        WebSocketSession previousMatch = matchedUsers.remove(session);
+//        if (previousMatch != null) {
+//            matchedUsers.remove(previousMatch);
+//
+//            // Temporarily block these two users from matching again
+//            previousMatches.put(session, previousMatch);
+//            previousMatches.put(previousMatch, session);
+//
+//            // Re-add both users to the queue but delay their ability to reconnect
+//            if (session.isOpen()) matchmakingQueue.add(session);
+//            if (previousMatch.isOpen()) matchmakingQueue.add(previousMatch);
+//
+//            // Find new matches for both users
+//            findMatch(session);
+//            findMatch(previousMatch);
+//        }
+//    }
+//    
+//    private void handleSkip(WebSocketSession session) throws Exception {
+//        WebSocketSession previousMatch = matchedUsers.remove(session);
+//        if (previousMatch != null) {
+//            matchedUsers.remove(previousMatch);
+//            previousMatches.put(session, previousMatch);
+//            previousMatches.put(previousMatch, session);
+//
+//            // Put both users back in the matchmaking queue
+//            if (session.isOpen()) matchmakingQueue.add(session);
+//            if (previousMatch.isOpen()) matchmakingQueue.add(previousMatch);
+//
+//            // Find new matches for both users
+//            findMatch(session);
+//            findMatch(previousMatch);
+//        }
+//    }
+
+    private void sendQueueSize(WebSocketSession session) throws Exception {
+        int queueSize = matchmakingQueue.size();
+        session.sendMessage(new TextMessage("{\"type\":\"queueSize\",\"count\":" + queueSize + "}"));
+    }
+
+    private void sendMessageToMatchedUser(WebSocketSession session, String message) throws Exception {
+        WebSocketSession matchedSession = matchedUsers.get(session);
+
+        if (matchedSession != null && matchedSession.isOpen()) {
+            try {
+                synchronized (matchedSession) {
+                    matchedSession.sendMessage(new TextMessage(message));
+                }
+            } catch (IOException e) {
+                System.out.println("Error sending message: " + e.getMessage());
+                matchedSession.close(CloseStatus.SERVER_ERROR);
+            }
+        }
+    }
+ 
+    
+    private void findMatch(WebSocketSession session) throws Exception {
+        if (session == null || !session.isOpen()) {
+            return;
+        }
+
+        // Try to find a compatible partner from the queue
+        WebSocketSession partner = null;
+        for (WebSocketSession potentialPartner : matchmakingQueue) {
+            if (potentialPartner.isOpen() 
+                    && !previousMatches.containsKey(session) 
+                    || previousMatches.get(session) != potentialPartner) {
+                partner = potentialPartner;
+                break;
             }
         }
 
-        // Attempt to find a match from the queue
-        WebSocketSession partner = matchmakingQueue.poll();
+        // If a compatible partner is found, remove them from the queue and match
+        if (partner != null) {
+            matchmakingQueue.remove(partner);
+            matchmakingQueue.remove(session);
 
-        if (partner != null && partner.isOpen() && session.isOpen()) {
-            // If a match is found, notify both users and store their pair
             notifyUsers(session, partner);
             matchedUsers.put(session, partner);
             matchedUsers.put(partner, session);
         } else {
-            // If no match is found or session is closed, add the session to the queue
-            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+            // If no compatible partner is found, add the session to the queue
+            if (!disconnectedUsers.contains(session)) {
                 matchmakingQueue.add(session);
             }
-            System.out.println("User count: " + matchmakingQueue.size());
         }
     }
+    
+    
+    
+//    private void findMatch(WebSocketSession session) throws Exception {
+//        // Check if the user was previously matched with someone
+//        WebSocketSession previousMatch = previousMatches.get(session);
+//
+//        // Remove the session if it's been too long since they were last matched
+//        if (previousMatch != null && matchmakingQueue.contains(previousMatch)) {
+//            matchmakingQueue.remove(previousMatch);
+//
+//            // Don't reconnect skipped users immediately
+//            if (previousMatch.isOpen() && session.isOpen()) {
+//                // If you don't want them to be reconnected immediately, simply return here
+//                // and do not match them again in this step.
+//                return;
+//            }
+//        }
+//
+//        // Attempt to find a match from the queue
+//        WebSocketSession partner = matchmakingQueue.poll();
+//
+//        // Match the session with a new partner if available
+//        if (partner != null && partner.isOpen() && session.isOpen()) {
+//            // Ensure it's not the same user they just skipped
+//            if (!previousMatches.containsKey(session) || previousMatches.get(session) != partner) {
+//                notifyUsers(session, partner);
+//                matchedUsers.put(session, partner);
+//                matchedUsers.put(partner, session);
+//            } else {
+//                // Add them back into the queue and skip this round of matching
+//                matchmakingQueue.add(session);
+//            }
+//        } else {
+//            // If no match is found or session is closed, add the session to the queue
+//            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+//                matchmakingQueue.add(session);
+//            }
+//        }
+//    }
+//    
+//    private void findMatch(WebSocketSession session) throws Exception {
+//        // Check if the user was previously matched with someone
+//        WebSocketSession previousMatch = previousMatches.get(session);
+//
+//        // If the previous match is in the queue and both are open, reconnect them
+//        if (previousMatch != null && matchmakingQueue.contains(previousMatch)) {
+//            matchmakingQueue.remove(previousMatch);
+//            if (previousMatch.isOpen() && session.isOpen()) {
+//                notifyUsers(session, previousMatch);
+//                matchedUsers.put(session, previousMatch);
+//                matchedUsers.put(previousMatch, session);
+//                return;
+//            }
+//        }
+//
+//        // Attempt to find a match from the queue
+//        WebSocketSession partner = matchmakingQueue.poll();
+//
+//        if (partner != null && partner.isOpen() && session.isOpen()) {
+//            // If a match is found, notify both users and store their pair
+//            notifyUsers(session, partner);
+//            matchedUsers.put(session, partner);
+//            matchedUsers.put(partner, session);
+//        } else {
+//            // If no match is found or session is closed, add the session to the queue
+//            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+//                matchmakingQueue.add(session);
+//            }
+//            System.out.println("User count: " + matchmakingQueue.size());
+//        }
+//    }
 
     private void notifyUsers(WebSocketSession session1, WebSocketSession session2) throws Exception {
-        String notification = "Matched!";
+        String notification = "{\"type\":\"match\",\"message\":\"Matched!\"}"; // JSON formatted notification
+
         // Check if session1 is still open before sending a message
         if (session1.isOpen()) {
             synchronized (session1) {
@@ -135,7 +290,294 @@ public class ChatHandler extends TextWebSocketHandler {
             System.out.println("Session2 is closed, cannot send notification.");
         }
     }
+    
+    private void broadcastUserCount() throws Exception {
+        int totalUserCount = activeSessions.size();
+        System.out.println("Broadcasting user count: " + totalUserCount); // Add this log
+        String message = "{\"type\":\"userCount\",\"count\":" + totalUserCount + "}";
+
+        for (WebSocketSession session : activeSessions.values()) {
+            if (session.isOpen()) {
+                session.sendMessage(new TextMessage(message));
+            }
+        }
+    }   
 }
+
+
+
+//import java.io.IOException;
+//import java.util.Map;
+//import java.util.Queue;
+//import java.util.Set;
+//import java.util.concurrent.ConcurrentHashMap;
+//import java.util.concurrent.ConcurrentLinkedQueue;
+//import java.util.concurrent.CopyOnWriteArraySet;
+//
+//import org.springframework.web.socket.CloseStatus;
+//import org.springframework.web.socket.TextMessage;
+//import org.springframework.web.socket.WebSocketSession;
+//import org.springframework.web.socket.handler.TextWebSocketHandler;
+//
+//public class ChatHandler extends TextWebSocketHandler {
+//    private static Map<String, WebSocketSession> activeSessions = new ConcurrentHashMap<>();
+//    private final Queue<WebSocketSession> matchmakingQueue = new ConcurrentLinkedQueue<>();
+//    private final Map<WebSocketSession, WebSocketSession> matchedUsers = new ConcurrentHashMap<>();
+//    private final Set<WebSocketSession> disconnectedUsers = new CopyOnWriteArraySet<>();
+//    private final Map<WebSocketSession, WebSocketSession> previousMatches = new ConcurrentHashMap<>();
+//
+//    @Override
+//    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+//        // Store active session
+//        activeSessions.put(session.getId(), session);
+//        disconnectedUsers.remove(session);
+//        findMatch(session);
+//    }
+//
+//    @Override
+//    public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+//        String payload = message.getPayload();
+//
+//        // Send message only to the matched user
+//        WebSocketSession matchedSession = matchedUsers.get(session);
+//
+//        if (matchedSession != null && matchedSession.isOpen()) {
+//            try {
+//                synchronized (matchedSession) {
+//                    matchedSession.sendMessage(new TextMessage(payload));
+//                }
+//            } catch (IOException e) {
+//                System.out.println("Error sending message: " + e.getMessage());
+//                matchedSession.close(CloseStatus.SERVER_ERROR);
+//            }
+//        }
+//    }
+//
+//    @Override
+//    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+//        // Remove the session from the active sessions
+//        activeSessions.remove(session.getId());
+//
+//        // Remove the session from the matchmaking queue if it's still there
+//        matchmakingQueue.remove(session);
+//
+//        // If the user was already matched, unpair the matched users
+//        WebSocketSession matchedSession = matchedUsers.remove(session);
+//        if (matchedSession != null) {
+//            matchedUsers.remove(matchedSession);
+//            // Store this pair in previousMatches to track disconnected pairs
+//            previousMatches.put(session, matchedSession);
+//            previousMatches.put(matchedSession, session);
+//
+//            // Optionally, put the unmatched user back in the matchmaking queue
+//            if (matchedSession.isOpen() && !disconnectedUsers.contains(matchedSession)) {
+//                matchmakingQueue.add(matchedSession);
+//                findMatch(matchedSession);
+//            }
+//        }
+//
+//        // Add the disconnected user to the set to prevent re-queueing
+//        disconnectedUsers.add(session);
+//
+//        // Try to find matches for remaining users in the queue
+//        if (!matchmakingQueue.isEmpty()) {
+//            WebSocketSession nextUser = matchmakingQueue.poll();
+//            if (nextUser != null && nextUser.isOpen()) {
+//                findMatch(nextUser);
+//            }
+//        }
+//    }
+//
+//    private void findMatch(WebSocketSession session) throws Exception {
+//        // Check if the user was previously matched with someone
+//        WebSocketSession previousMatch = previousMatches.get(session);
+//
+//        // If the previous match is in the queue and both are open, reconnect them
+//        if (previousMatch != null && matchmakingQueue.contains(previousMatch)) {
+//            matchmakingQueue.remove(previousMatch);
+//            if (previousMatch.isOpen() && session.isOpen()) {
+//                notifyUsers(session, previousMatch);
+//                matchedUsers.put(session, previousMatch);
+//                matchedUsers.put(previousMatch, session);
+//                return;
+//            }
+//        }
+//
+//        // Attempt to find a match from the queue
+//        WebSocketSession partner = matchmakingQueue.poll();
+//
+//        if (partner != null && partner.isOpen() && session.isOpen()) {
+//            // If a match is found, notify both users and store their pair
+//            notifyUsers(session, partner);
+//            matchedUsers.put(session, partner);
+//            matchedUsers.put(partner, session);
+//        } else {
+//            // If no match is found or session is closed, add the session to the queue
+//            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+//                matchmakingQueue.add(session);
+//            }
+//            System.out.println("User count: " + matchmakingQueue.size());
+//        }
+//    }
+//
+//    private void notifyUsers(WebSocketSession session1, WebSocketSession session2) throws Exception {
+//        String notification = "{\"type\":\"match\",\"message\":\"Matched!\"}"; // JSON formatted notification
+//
+//        // Check if session1 is still open before sending a message
+//        if (session1.isOpen()) {
+//            synchronized (session1) {
+//                session1.sendMessage(new TextMessage(notification));
+//            }
+//        } else {
+//            System.out.println("Session1 is closed, cannot send notification.");
+//        }
+//
+//        // Check if session2 is still open before sending a message
+//        if (session2.isOpen()) {
+//            synchronized (session2) {
+//                session2.sendMessage(new TextMessage(notification));
+//            }
+//        } else {
+//            System.out.println("Session2 is closed, cannot send notification.");
+//        }
+//    }
+//}
+
+//import java.io.IOException;
+//import java.util.Map;
+//import java.util.Queue;
+//import java.util.Set;
+//import java.util.concurrent.ConcurrentHashMap;
+//import java.util.concurrent.ConcurrentLinkedQueue;
+//import java.util.concurrent.CopyOnWriteArraySet;
+//
+//import org.springframework.web.socket.CloseStatus;
+//import org.springframework.web.socket.TextMessage;
+//import org.springframework.web.socket.WebSocketSession;
+//import org.springframework.web.socket.handler.TextWebSocketHandler;
+//
+//public class ChatHandler extends TextWebSocketHandler {
+//    private static Map<String, WebSocketSession> activeSessions = new ConcurrentHashMap<>();
+//    private final Queue<WebSocketSession> matchmakingQueue = new ConcurrentLinkedQueue<>();
+//    private final Map<WebSocketSession, WebSocketSession> matchedUsers = new ConcurrentHashMap<>();
+//    private final Set<WebSocketSession> disconnectedUsers = new CopyOnWriteArraySet<>();
+//    private final Map<WebSocketSession, WebSocketSession> previousMatches = new ConcurrentHashMap<>();
+//
+//    @Override
+//    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+//        // Store active session
+//        activeSessions.put(session.getId(), session);
+//        disconnectedUsers.remove(session);
+//        findMatch(session);
+//    }
+//
+//    @Override
+//    public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+//        String payload = message.getPayload();
+//
+//        // Send message only to the matched user
+//        WebSocketSession matchedSession = matchedUsers.get(session);
+//
+//        if (matchedSession != null && matchedSession.isOpen()) {
+//            try {
+//                synchronized (matchedSession) {
+//                    matchedSession.sendMessage(new TextMessage(payload));
+//                }
+//            } catch (IOException e) {
+//                System.out.println("Error sending message: " + e.getMessage());
+//                matchedSession.close(CloseStatus.SERVER_ERROR);
+//            }
+//        }
+//    }
+//
+//    @Override
+//    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+//        // Remove the session from the active sessions
+//        activeSessions.remove(session.getId());
+//
+//        // Remove the session from the matchmaking queue if it's still there
+//        matchmakingQueue.remove(session);
+//
+//        // If the user was already matched, unpair the matched users
+//        WebSocketSession matchedSession = matchedUsers.remove(session);
+//        if (matchedSession != null) {
+//            matchedUsers.remove(matchedSession);
+//            // Store this pair in previousMatches to track disconnected pairs
+//            previousMatches.put(session, matchedSession);
+//            previousMatches.put(matchedSession, session);
+//
+//            // Optionally, put the unmatched user back in the matchmaking queue
+//            if (matchedSession.isOpen() && !disconnectedUsers.contains(matchedSession)) {
+//                matchmakingQueue.add(matchedSession);
+//                findMatch(matchedSession);
+//            }
+//        }
+//
+//        // Add the disconnected user to the set to prevent re-queueing
+//        disconnectedUsers.add(session);
+//
+//        // Try to find matches for remaining users in the queue
+//        if (!matchmakingQueue.isEmpty()) {
+//            WebSocketSession nextUser = matchmakingQueue.poll();
+//            if (nextUser != null && nextUser.isOpen()) {
+//                findMatch(nextUser);
+//            }
+//        }
+//    }
+//
+//    private void findMatch(WebSocketSession session) throws Exception {
+//        // Check if the user was previously matched with someone
+//        WebSocketSession previousMatch = previousMatches.get(session);
+//
+//        // If the previous match is in the queue and both are open, reconnect them
+//        if (previousMatch != null && matchmakingQueue.contains(previousMatch)) {
+//            matchmakingQueue.remove(previousMatch);
+//            if (previousMatch.isOpen() && session.isOpen()) {
+//                notifyUsers(session, previousMatch);
+//                matchedUsers.put(session, previousMatch);
+//                matchedUsers.put(previousMatch, session);
+//                return;
+//            }
+//        }
+//
+//        // Attempt to find a match from the queue
+//        WebSocketSession partner = matchmakingQueue.poll();
+//
+//        if (partner != null && partner.isOpen() && session.isOpen()) {
+//            // If a match is found, notify both users and store their pair
+//            notifyUsers(session, partner);
+//            matchedUsers.put(session, partner);
+//            matchedUsers.put(partner, session);
+//        } else {
+//            // If no match is found or session is closed, add the session to the queue
+//            if (session.isOpen() && !disconnectedUsers.contains(session)) {
+//                matchmakingQueue.add(session);
+//            }
+//            System.out.println("User count: " + matchmakingQueue.size());
+//        }
+//    }
+//
+//    private void notifyUsers(WebSocketSession session1, WebSocketSession session2) throws Exception {
+//        String notification = "Matched!";
+//        // Check if session1 is still open before sending a message
+//        if (session1.isOpen()) {
+//            synchronized (session1) {
+//                session1.sendMessage(new TextMessage(notification));
+//            }
+//        } else {
+//            System.out.println("Session1 is closed, cannot send notification.");
+//        }
+//
+//        // Check if session2 is still open before sending a message
+//        if (session2.isOpen()) {
+//            synchronized (session2) {
+//                session2.sendMessage(new TextMessage(notification));
+//            }
+//        } else {
+//            System.out.println("Session2 is closed, cannot send notification.");
+//        }
+//    }
+//}
 
 
 //package com.robin.omegle.bean;
